@@ -81,7 +81,7 @@ const unsigned long batteryCheckInterval = 5000;
 
 int currentAngle = 0;
 int smoothedLight = 0;
-float currentTemp = 0.0;3
+float currentTemp = 0.0;
 bool autoMode = true; 
 bool invertMode = false; 
 
@@ -102,6 +102,12 @@ int readSmoothedBattery(int pin, int samples = 30) {
     delay(2); 
   }
   return sum / samples;
+}
+
+float getBatteryVoltage() {
+  int raw = readSmoothedBattery(ADC_PIN);
+  float vpin = raw * VREF / ADC_MAX;
+  return vpin * VOLTAGE_DIVIDER_RATIO;
 }
 
 bool isStable(int* history, int length, int threshold) {
@@ -155,6 +161,30 @@ void setInvertMode(bool enabled) {
   preferences.end();
 }
 
+void handleAutoAngleControl() {
+  int stabilityThreshold = map(lightSensitivityLevel, 0, 100, 100, 10);
+  if (!isStable(lightHistory, stabilityWindow, stabilityThreshold)) return;
+
+  int lightAngle = invertMode
+    ? map(smoothedLight, 0, 4095, MAX_ANGLE, MIN_ANGLE)
+    : map(smoothedLight, 0, 4095, MIN_ANGLE, MAX_ANGLE);
+  lightAngle = constrain(lightAngle, MIN_ANGLE, MAX_ANGLE);
+
+  int tempAngle = map(currentTemp, 15, 35, MIN_ANGLE, MAX_ANGLE);
+  tempAngle = constrain(tempAngle, MIN_ANGLE, MAX_ANGLE);
+
+  int lightWeight = 100 - tempSensitivityLevel;
+  int tempWeight = tempSensitivityLevel;
+  int blendedAngle = (lightAngle * lightWeight + tempAngle * tempWeight) / 100;
+  blendedAngle = constrain(blendedAngle, MIN_ANGLE, MAX_ANGLE);
+
+  int deadband = map(lightSensitivityLevel, 0, 100, 20, 3);
+  if (abs(blendedAngle - currentAngle) >= deadband) {
+    smoothServoMove(myServo, currentAngle, blendedAngle);
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
 
@@ -178,20 +208,17 @@ void setup() {
 }
 
 void loop() {
-  // === TEMP and LIGHT READING ===
   smoothedLight = readSmoothedLight(sensorPin);
-  currentTemp = dht.readTemperature(); // Celsius
+  currentTemp = dht.readTemperature(); 
 
-  // Light Stability Buffer
   lightHistory[historyIndex++] = smoothedLight;
   if (historyIndex >= stabilityWindow) {
     historyIndex = 0;
     bufferFilled = true;
   }
 
-  Serial.println(dht.readTemperature());
+  // ==================== temp ====================
 
-  // Notify temp if changed
   unsigned long now = millis();
   float tempNotifyThreshold = map(tempSensitivityLevel, 0, 100, 3.0, 0.2);
   if ((abs(currentTemp - lastNotifiedTemp) >= tempNotifyThreshold) &&
@@ -202,7 +229,8 @@ void loop() {
     lastTempNotifyTime = now;
   }
 
-  // Light notify
+  // ==================== light ====================
+
   int lightNotifyThreshold = map(lightSensitivityLevel, 0, 100, 30, 5);
   if ((abs(smoothedLight - lastNotifiedLight) >= lightNotifyThreshold) &&
       (now - lastLightNotifyTime >= notifyMinIntervalMs)) {
@@ -212,22 +240,21 @@ void loop() {
     lastLightNotifyTime = now;
   }
 
-  //--- Battery Voltage ---
-  int raw = readSmoothedBattery(ADC_PIN);
-  float vpin = raw * VREF / ADC_MAX;
-  float battV = vpin * VOLTAGE_DIVIDER_RATIO;
+  // ==================== battery ====================
 
 
+  float battV = getBatteryVoltage();
 
-  if ((millis() - lastServoMoveTime > batteryQuietTime) &&
-      (millis() - lastBatteryCheckTime > batteryCheckInterval)) {
+  bool quietEnough = millis() - lastServoMoveTime > batteryQuietTime;
+  bool checkIntervalPassed = millis() - lastBatteryCheckTime > batteryCheckInterval;
+
+  if (quietEnough && checkIntervalPassed) {
     lastBatteryCheckTime = millis();
 
-    int raw = readSmoothedBattery(ADC_PIN);
-    float vpin = raw * VREF / ADC_MAX;
-    float battV = vpin * VOLTAGE_DIVIDER_RATIO;
+    bool significantChange = abs(battV - lastNotifiedBatt) >= 0.05;
+    bool notifyTimeout = millis() - lastBattNotifyTime > 5000;
 
-    if (abs(battV - lastNotifiedBatt) >= 0.05 || millis() - lastBattNotifyTime > 5000) {
+    if (significantChange || notifyTimeout) {
       battCharacteristic->setValue(battV);
       battCharacteristic->notify();
       lastNotifiedBatt = battV;
@@ -235,26 +262,12 @@ void loop() {
     }
   }
 
-  // === AUTO MODE ANGLE CONTROL ===
-  if (autoMode && bufferFilled && isStable(lightHistory, stabilityWindow, map(lightSensitivityLevel, 0, 100, 100, 10))) {
-    int lightAngle = invertMode
-      ? map(smoothedLight, 0, 4095, MAX_ANGLE, MIN_ANGLE)
-      : map(smoothedLight, 0, 4095, MIN_ANGLE, MAX_ANGLE);
-    lightAngle = constrain(lightAngle, MIN_ANGLE, MAX_ANGLE);
+  // ==================== auto mode ====================
 
-    int tempAngle = map(currentTemp, 15, 35, MIN_ANGLE, MAX_ANGLE);
-    tempAngle = constrain(tempAngle, MIN_ANGLE, MAX_ANGLE);
-
-    int lightWeight = 100 - tempSensitivityLevel;
-    int tempWeight = tempSensitivityLevel;
-    int blendedAngle = (lightAngle * lightWeight + tempAngle * tempWeight) / 100;
-    blendedAngle = constrain(blendedAngle, MIN_ANGLE, MAX_ANGLE);
-
-    int deadband = map(lightSensitivityLevel, 0, 100, 20, 3);
-    if (abs(blendedAngle - currentAngle) >= deadband) {
-      smoothServoMove(myServo, currentAngle, blendedAngle);
-    }
+  if (autoMode && bufferFilled) {
+    handleAutoAngleControl();
   }
+
 
   delay(200);
 }
